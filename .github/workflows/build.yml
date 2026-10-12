@@ -1,0 +1,20 @@
+name: Build
+on:
+  push:
+    branches:
+    - master
+  pull_request:
+    branches:
+    - master
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: alpine
+    steps:
+      - name: Build
+        run: |
+          wget -qO- "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/raw/$GITHUB_SHA/.github/scripts/build" | sh -es

@@ -1,0 +1,71 @@
+#!/bin/sh
+set -e
+
+echo "=== Install dependencies ==="
+apk add --no-cache -q gcc make musl-dev linux-headers indent cppcheck py3-pip git
+pip install --break-system-packages lizard --quiet
+
+echo "=== Setup non-root user ==="
+uid=$(shuf -i2000-9999 -n1)
+install -o "$uid" -g "$uid" -m 755 -d /tmp/w
+install -o "$uid" -g "$uid" -m 644 /dev/null "$GITHUB_STEP_SUMMARY"
+
+echo "=== Build ==="
+HOME=/tmp/w nsenter "--setuid=$uid" "--setgid=$uid" "--wd=/tmp/w" sh -es <<'BUILD'
+echo "=== Checkout ==="
+git init -q
+git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+git fetch -q --depth=1 origin "${GITHUB_SHA}"
+git checkout -qf "${GITHUB_SHA}"
+
+echo "=== Format check ==="
+make format
+git diff --exit-code
+
+echo "=== Lint ==="
+make lint
+
+echo "=== Build ==="
+make -j4
+
+echo "=== Lizard summary ==="
+{
+  echo '## Code Metrics (lizard)'
+  echo ''
+  echo '| Module | NLOC | AvgCCN | AvgToken | Functions |'
+  echo '|--------|-----:|-------:|---------:|----------:|'
+  lizard -l cpp -C 6 -L 40 -a 5 -T token_count=150 \
+    -x 'src/cast/tls/crypto/*' src/ 2>/dev/null \
+    | awk '$NF ~ /@/ && $NF ~ /\.(c|h)$/ {
+             n = split($NF, p, "@"); f = p[n];
+             fn[f]++; nl[f] += $1; cc[f] += $2; tk[f] += $3;
+           }
+           END { for (f in fn)
+                   printf("%.0f|%.1f|%.1f|%d|%s\n",
+                          nl[f], cc[f]/fn[f], tk[f]/fn[f], fn[f], f); }' \
+    | sort -t'|' -k1 -rn \
+    | awk -F'|' '{ sub(/^src\//, "", $5);
+                   printf("| %s | %s | %s | %s | %d |\n", $5, $1, $2, $3, $4); }'
+} >> "$GITHUB_STEP_SUMMARY"
+
+echo "=== Test & Coverage ==="
+make coverage 2>&1
+
+echo "=== Coverage summary ==="
+{
+  echo '## Code Coverage'
+  echo ''
+  echo '| Module | Lines | Coverage |'
+  echo '|--------|------:|---------:|'
+  awk -f tests/coverage.awk obj/gcov/*.gcov 2>/dev/null \
+    | awk '$1 ~ /^src\// {
+             pct = $2; sub(/%/, "", pct);
+             span = $3; gsub(/[()]/, "", span); split(span, a, "/");
+             printf("%f|%d|%s\n", pct, a[2], $1);
+           }' \
+    | sort -t'|' -k1 -rn \
+    | awk -F'|' '{ sub(/^src\//, "", $3);
+                   printf("| %s | %d | %.2f%% |\n", $3, $2, $1); }'
+} >> "$GITHUB_STEP_SUMMARY"
+
+BUILD

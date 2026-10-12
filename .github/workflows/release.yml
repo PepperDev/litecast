@@ -1,0 +1,25 @@
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Semver tag (e.g. v1.2.3). Leave empty to auto-increment from latest.
+        type: string
+        default: ''
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    container:
+      image: alpine
+    steps:
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          wget -qO- "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/raw/$GITHUB_SHA/.github/scripts/release" | sh -es

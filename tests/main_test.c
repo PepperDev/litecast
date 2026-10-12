@@ -345,6 +345,10 @@ static void fake_device(int c2p, int p2c)
   int cfd;
   int r;
 
+  /* The run closes the control socket right after its exit STOP, so the
+   * STOP ack can race into EPIPE. The mock, like any socket peer, must not
+   * die on that benign close (the run ignores SIGPIPE for the same reason). */
+  (void)signal(SIGPIPE, SIG_IGN);
   lfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (lfd < 0)
     _exit(1);

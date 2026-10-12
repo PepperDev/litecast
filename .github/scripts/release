@@ -1,0 +1,177 @@
+#!/bin/sh
+set -e
+
+echo "=== Install dependencies ==="
+apk add --no-cache -q make xz dpkg rpm github-cli fakeroot
+echo "=== Download musl toolchains ==="
+MIRROR_BASE="https://github.com/musl-cc/musl.cc/releases/download/v0.0.1"
+BASE="$MIRROR_BASE"
+if curl -sfLI --connect-timeout 5 --max-time 10 "https://musl.cc/" >/dev/null 2>&1; then
+  BASE="https://musl.cc"
+fi
+mkdir -p /opt/musl
+for tc in \
+  x86_64-linux-musl-cross \
+  i686-linux-musl-cross \
+  arm-linux-musleabihf-cross \
+  arm-linux-musleabi-cross \
+  aarch64-linux-musl-cross
+do
+  echo "Downloading $tc from $BASE..."
+  wget -qO- "$BASE/$tc.tgz" | tar -xzf- -C /opt/musl
+done
+chmod -R a+rX /opt/musl
+
+echo "=== Setup non-root user ==="
+uid=$(shuf -i2000-9999 -n1)
+install -o "$uid" -g "$uid" -m 755 -d /tmp/w
+
+echo "=== Release ==="
+HOME=/tmp/w nsenter "--setuid=$uid" "--setgid=$uid" "--wd=/tmp/w" sh -es <<'RELEASE'
+set -e
+
+RPMDB=/tmp/rpmdb
+rpm --initdb --dbpath "$RPMDB"
+echo "=== Checkout ==="
+git init -q
+git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+git fetch --tags -q --depth=1 origin "${GITHUB_REF}"
+git checkout -qf "${GITHUB_SHA}"
+
+echo "=== Determine version ==="
+INPUT_TAG="${INPUT_TAG:-}"
+if [ -n "$INPUT_TAG" ]; then
+  TAG="$INPUT_TAG"
+  case "$TAG" in v*) ;; *) TAG="v$TAG" ;; esac
+else
+  LAST=$(git tag | sort -V | tail -1)
+  if [ -z "$LAST" ]; then
+    TAG="v0.1.0"
+  else
+    TAG=$(echo "$LAST" | awk -F. '/^v/ {printf "v%d.%d.%d", substr($1,2)+0, $2+0, $3+1}')
+  fi
+fi
+VERSION="${TAG#v}"
+echo "tag=$TAG version=$VERSION"
+
+echo "=== Generate changelog ==="
+{
+  echo "## Changelog"
+  echo ""
+  PREV=$(git describe --tags --abbrev=0 2>/dev/null || true)
+  if [ -n "$PREV" ]; then
+    git log "$PREV..HEAD" --oneline --no-decorate
+  else
+    git log --oneline --no-decorate
+  fi
+} > changelog.md
+
+echo "=== Build and package ==="
+mkdir -p artifacts
+for t in \
+  x86_64-linux-musl:amd64:x86_64 \
+  i686-linux-musl:i386:i386 \
+  arm-linux-musleabihf:armhf:armv7hl \
+  arm-linux-musleabi:armel:armv5tel \
+  aarch64-linux-musl:arm64:aarch64
+do
+  MUSL_ARCH="${t%%:*}"
+  rest="${t#*:}"
+  DEB_ARCH="${rest%%:*}"
+  RPM_ARCH="${rest##*:}"
+  NAME="${MUSL_ARCH%%-linux-musl*}"
+  echo "=== Building for $NAME ($MUSL_ARCH) ==="
+
+  export PATH="/opt/musl/$MUSL_ARCH-cross/bin:$PATH"
+  make clean
+  make CC="${MUSL_ARCH}-gcc" -j4
+  "${MUSL_ARCH}-strip" bin/litecast
+
+  mkdir -p dist
+  cp bin/litecast dist/
+  cp man/litecast.1 dist/
+
+  if [ "$NAME" = "arm" ]; then
+    PKGNAME="litecast-${DEB_ARCH}-${VERSION}"
+  else
+    PKGNAME="litecast-${NAME}-${VERSION}"
+  fi
+
+  # tar.xz
+  XZ_OPT=-9e fakeroot tar -cJf "${PKGNAME}.tar.xz" --numeric-owner -C dist litecast litecast.1
+
+  # .deb
+  PKGDIR="litecast_${VERSION}_${DEB_ARCH}"
+  mkdir -p "$PKGDIR/DEBIAN" "$PKGDIR/usr/bin" "$PKGDIR/usr/share/man/man1"
+  install -m 755 dist/litecast "$PKGDIR/usr/bin/"
+  install -m 644 dist/litecast.1 "$PKGDIR/usr/share/man/man1/"
+  gzip -9 "$PKGDIR/usr/share/man/man1/litecast.1"
+  {
+    echo "Package: litecast"
+    echo "Version: ${VERSION}"
+    echo "Section: utils"
+    echo "Priority: optional"
+    echo "Architecture: ${DEB_ARCH}"
+    echo "Maintainer: litecast contributors"
+    echo "Description: Stream local media, or a command's output, to a Chromecast"
+  } > "$PKGDIR/DEBIAN/control"
+  fakeroot dpkg-deb --build "$PKGDIR" >/dev/null
+
+  # .rpm
+  RPMDIR="$HOME/rpmbuild"
+  mkdir -p "$RPMDIR/SPECS" \
+    "$RPMDIR/RPMS" \
+    "$RPMDIR/SRPMS" \
+    "$RPMDIR/BUILD" \
+    "$RPMDIR/SOURCES"
+  {
+    echo "Name: litecast"
+    echo "Version: ${VERSION}"
+    echo "Release: 1"
+    echo "Summary: Stream local media, or a command's output, to a Chromecast"
+    echo "License: MIT"
+    echo "Group: Applications/System"
+    echo "%description"
+    echo "Streams local media files, or the output of an arbitrary command, to a Chromecast (Google Cast) device on the same network."
+    echo ""
+    echo "%install"
+    echo "mkdir -p \$RPM_BUILD_ROOT/usr/bin"
+    echo "mkdir -p \$RPM_BUILD_ROOT/usr/share/man/man1"
+    echo "install -m 755 %{_sourcedir}/litecast \$RPM_BUILD_ROOT/usr/bin/"
+    echo "install -m 644 %{_sourcedir}/litecast.1 \$RPM_BUILD_ROOT/usr/share/man/man1/"
+    echo ""
+    echo "%files"
+    echo "%defattr(-,root,root,-)"
+    echo "/usr/bin/litecast"
+    echo "/usr/share/man/man1/litecast.1*"
+  } > "$RPMDIR/SPECS/litecast.spec"
+  cp dist/* "$RPMDIR/SOURCES/"
+  HOST_ARCH=$(rpm --eval "%{_arch}" 2>/dev/null || uname -m)
+  rpmbuild -ba --define "_topdir $RPMDIR" --define "_dbpath $RPMDB" \
+    --define "__strip /bin/true" \
+    --define "__os_install_post %{nil}" "$RPMDIR/SPECS/litecast.spec"
+  cp "$RPMDIR/RPMS/$HOST_ARCH/litecast-${VERSION}-1.${HOST_ARCH}.rpm" \
+     "litecast-${VERSION}-1.${RPM_ARCH}.rpm"
+
+  mv "${PKGNAME}.tar.xz" artifacts/
+  mv "litecast_${VERSION}_${DEB_ARCH}.deb" artifacts/
+  mv "litecast-${VERSION}-1.${RPM_ARCH}.rpm" artifacts/
+
+  rm -rf dist "$PKGDIR" "$RPMDIR"
+done
+ls -la artifacts/
+
+echo "=== Create tag ==="
+git tag "$TAG"
+git remote set-url origin \
+  "${GITHUB_SERVER_URL%%://*}://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#*://}/${GITHUB_REPOSITORY}.git"
+git -c 'user.name=github-actions[bot]' \
+  -c 'user.email=github-actions[bot]@users.noreply.github.com' \
+  push origin "refs/tags/$TAG"
+
+echo "=== Create release ==="
+gh release create "$TAG" \
+  --title "$TAG" \
+  --notes-file changelog.md \
+  artifacts/*
+RELEASE
