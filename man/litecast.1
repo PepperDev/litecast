@@ -1,0 +1,94 @@
+.TH LITECAST 1 "September 2026" "litecast 0.1.0" "User Commands"
+.SH NAME
+litecast \- stream media to a Chromecast from the local machine
+.SH SYNOPSIS
+.B litecast
+.RB [ \-b " "\fISIZE\fP | "\-\-cache" " "\fISIZE\fP ]
+.RB [ \-s | \-\-cache\-to\-fs ]
+.RB [ \-d " "\fINAME\fP | "\-\-device" " "\fINAME\fP ]
+.RB [ \-n | \-\-no\-arbitrary\-range ]
+.RB ( \-f | \-\-file " | " \-c | \-\-command )
+.RB [ \-\- ]
+.IR FILES... " | " command-and-args..."
+.SH DESCRIPTION
+.B litecast
+discovers a Chromecast on the local network, connects to its Cast V2
+endpoint, and serves a local media source purely as a source: the device
+pulls the stream, litecast only feeds it from an in-memory buffer and an
+optional spool file.
+.PP
+No media validation is performed: container, codec, and SPS/PPS are never
+inspected, and the bytes are served verbatim.
+.PP
+In file mode operands are streamed one after another, `cat`\fB-\fPstyle, as a
+single concatenated stream. In command mode the operand list is executed
+directly with `fork`/`execvp` (never through a shell) and its standard
+output is cast.
+.SH OPTIONS
+.TP
+.BI "\-b " SIZE ", " "\-\-cache " SIZE
+Buffer size for the stream. Accepts a `K`/`M`/`G` suffix (case-insensitive)
+or a trailing `%`. Default `64M`; minimum one page; a percentage is capped
+at `100%` (values above are an error). In file mode a plain size is a
+fixed-capacity in-memory buffer; a `%` targets a fraction of the file's
+size (only trustworthy for regular files). In command mode the buffer is
+always dynamic, starting at one page and growing toward the configured
+size; `100%` grows with every byte, retaining the whole stream in memory.
+.TP
+.BI "\-s " ", " "\-\-cache\-to\-fs"
+Only meaningful in command mode (ignored in file mode). Spools 100% of the
+command output to a temp file that is created, opened, and immediately
+unlinked (a dangling file descriptor). The spool keeps a full copy of the
+command output on disk, independent of the buffer policy; the cast feed
+itself is live and non-seekable: `Content-Length` appears only once the
+command completes, and a `206` `Range` answer only for a closed range (the
+request pins the end, or `total` is known); see `\-n` for open-ended
+`Range` requests.
+.TP
+.BI "\-d " NAME ", " "\-\-device " NAME
+Select the cast target by friendly name. Matching is case-insensitive,
+with `*` as the only wildcard; a bare name falls back to substring
+matching (`*NAME*`). If no device matches within the discovery window the
+first discovered device is used. Without this option the first discovered
+device is used.
+.TP
+.B "\-n, \-\-no\-arbitrary\-range"
+Never choose the end of an open-ended `Range: bytes=N-` request. By default
+a stream of unknown length answers such a request with a legal `206` whose
+`Content-Range` end the server picks: the produced frontier once the bytes
+cover `N`, or `N+1` (one byte, held back until the producer reaches it)
+when a running producer is behind. This option forbids that and answers
+every open-ended `Range` on an unknown-length stream as a plain `200` from
+byte 0, restarting the device at the beginning instead of continuing where
+it stopped. Use it with a device that treats a short `206` as the end of
+the stream. No effect in file mode, where the total length is known up
+front; before the first byte is produced, or for a start already dropped
+from the buffer, `200` from byte 0 is used either way.
+.TP
+.B "\-f, \-\-file"
+Cast files (the default mode). Operands are treated as paths.
+.TP
+.B "\-c, \-\-command"
+Cast the standard output of a command. Operands are treated as the command
+and its arguments. Incompatible with `--file`; the last mode option wins.
+.TP
+.B "\-\-"
+End of option parsing. Every following token is an operand, even if it
+starts with `\-`.
+.TP
+.B "\-h, \-\-help"
+Print usage to standard output and exit 0.
+.TP
+.B "\-V, \-\-version"
+Print the version to standard output and exit 0.
+.SH EXIT STATUS
+.TP
+.B 0
+Clean exit: the stream finished, or `--help`/`--version` was requested.
+.TP
+.B 1
+Any failure: bad arguments, no device discovered, connection failure, or
+stream error.
+.SH SEE ALSO
+.BR README.md (top of the repository),
+.BR DOMAIN.md (design specification)
