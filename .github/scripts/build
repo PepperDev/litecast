@@ -14,7 +14,8 @@ echo "=== Build ==="
 HOME=/tmp/w nsenter "--setuid=$uid" "--setgid=$uid" "--wd=/tmp/w" sh -es <<'BUILD'
 echo "=== Checkout ==="
 git init -q
-git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+git remote add origin \
+  "${GITHUB_SERVER_URL%%://*}://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#*://}/${GITHUB_REPOSITORY}.git"
 git fetch -q --depth=1 origin "${GITHUB_SHA}"
 git checkout -qf "${GITHUB_SHA}"
 

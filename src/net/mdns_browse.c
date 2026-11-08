@@ -128,37 +128,95 @@ static long elapsed_ms(const struct timespec *t0)
   return (now.tv_sec - t0->tv_sec) * 1000L + (now.tv_nsec - t0->tv_nsec) / 1000000L;
 }
 
-/* Poll for up to the remaining window; an absolute deadline (not a per-call
- * timeout) keeps discovery bounded even when announcements never stop. */
-static int poll_until(struct pollfd *pf, const struct timespec *t0, int mswin)
+/* Absolute ms (from t0) at which the next browse send is due when `sent`
+ * queries have already gone out, or -1 when the send budget or the absolute
+ * window leaves no room. Sends land at 0/1/2s in the default 5s window; a
+ * short test window (LITECAST_MDNS_MS) simply skips those that do not fit. */
+static long send_at_ms(int sent, int mswin)
 {
-  long rem = (long)mswin - elapsed_ms(t0);
+  long at = (long)sent * MDNS_RESEND_MS;
+
+  return (sent < MDNS_SEND_MAX && at < (long)mswin) ? at : -1;
+}
+
+/* Poll one fd for up to `ms`; EINTR is retried. */
+static int poll_for(struct pollfd *pf, long ms)
+{
   int r;
 
-  if (rem <= 0)
-    return 0;
   do {
-    r = poll(pf, 1, (int)rem);
+    r = poll(pf, 1, (int)ms);
   } while (r < 0 && errno == EINTR);
-  if (r < 0)
-    return -1;
   return r;
+}
+
+/* Milliseconds until the next browse send or the window deadline. */
+static long wait_ms(long now, long next, int mswin)
+{
+  long wait = (long)mswin - now;
+
+  if (next >= 0 && next - now < wait)
+    wait = next - now;
+  return wait;
+}
+
+/* 0 = poll for the next event, 1 = the window lapsed, 2 = re-send is due. */
+static int next_action(long now, long next, int mswin)
+{
+  if (now >= (long)mswin)
+    return 1;
+  return (next >= 0 && next <= now) ? 2 : 0;
+}
+
+/* Receive one datagram into the discovery list; 0 ends discovery on a hard
+ * parse error, 1 keeps it going (a match is noticed by the caller's loop). */
+static int take_response(int fd, const char *pattern, struct dscan *s)
+{
+  if (mdns_recv(fd, s->devices, s->maxdev, &s->count) != 0)
+    return 0;
+  s->chosen = mdns_first(s->devices, s->count, pattern);
+  return 1;
+}
+
+/* Re-send the browse query and schedule the next one (a failed send never
+ * aborts the window). */
+static long resend(int fd, int *sent, int mswin)
+{
+  (void)mdns_browse(fd);
+  return send_at_ms(++*sent, mswin);
+}
+
+/* Poll once and take a response; 1 = stop discovery, 0 = keep going. */
+static int poll_step(struct pollfd *pf, int fd, const char *pattern, long ms, struct dscan *s)
+{
+  int r = poll_for(pf, ms);
+
+  if (r <= 0)
+    return r < 0;
+  return !take_response(fd, pattern, s);
 }
 
 static void listen_loop(int fd, const char *pattern, int mswin, struct dscan *s)
 {
   struct pollfd pf = { fd, POLLIN, 0 };
   struct timespec t0;
+  int sent = 1;
+  long next;
 
   clock_gettime(CLOCK_MONOTONIC, &t0);
+  next = send_at_ms(sent, mswin);
   while (s->chosen < 0) {
-    int r = poll_until(&pf, &t0, mswin);
+    long now = elapsed_ms(&t0);
+    int act = next_action(now, next, mswin);
 
-    if (r <= 0)
+    if (act == 1)
       break;
-    if (mdns_recv(fd, s->devices, s->maxdev, &s->count) != 0)
+    if (act == 2) {
+      next = resend(fd, &sent, mswin);
+      continue;
+    }
+    if (poll_step(&pf, fd, pattern, wait_ms(now, next, mswin), s))
       break;
-    s->chosen = mdns_first(s->devices, s->count, pattern);
   }
 }
 

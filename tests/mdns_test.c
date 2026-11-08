@@ -516,6 +516,37 @@ static int t_socket(void)
   return 0;
 }
 
+static int t_resend(void)
+{
+  struct mdns_device dev[MDNS_MAX_DEVICES];
+  struct dscan s = { dev, MDNS_MAX_DEVICES, 0, -1 };
+  struct timespec t0;
+  int fd;
+  long ms;
+
+  EXPECT(send_at_ms(1, MDNS_WINDOW_MS) == MDNS_RESEND_MS);
+  EXPECT(send_at_ms(2, MDNS_WINDOW_MS) == 2 * MDNS_RESEND_MS);
+  EXPECT(send_at_ms(MDNS_SEND_MAX, MDNS_WINDOW_MS) == -1);
+  EXPECT(send_at_ms(1, MDNS_RESEND_MS) == -1);
+  EXPECT(send_at_ms(1, MDNS_RESEND_MS + 100) == MDNS_RESEND_MS);
+  EXPECT(send_at_ms(2, MDNS_RESEND_MS + 100) == -1);
+
+  /* A short window: one re-send fires, then discovery still lapses at the
+   * absolute deadline (a non-matching pattern keeps chosen at -1 even if
+   * unrelated loopback traffic shows up). */
+  fd = mdns_socket("127.0.0.1");
+  if (fd < 0)
+    return 0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  listen_loop(fd, "zzz-no-matching-device", MDNS_RESEND_MS + 100, &s);
+  ms = elapsed_ms(&t0);
+  close(fd);
+  EXPECT(s.chosen == -1);
+  EXPECT(ms >= MDNS_RESEND_MS);
+  EXPECT(ms < MDNS_RESEND_MS + 1500);
+  return 0;
+}
+
 static int t_discover(void)
 {
   struct mdns_device dev[MDNS_MAX_DEVICES];
@@ -542,6 +573,7 @@ int main(void)
   RUN(t_internals);
   RUN(t_select);
   RUN(t_socket);
+  RUN(t_resend);
   RUN(t_discover);
   TEST_SUMMARY();
 }

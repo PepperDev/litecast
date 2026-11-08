@@ -29,7 +29,8 @@ compact reference so AGENTS.md is self-sufficient.
 
 Streams media to a Chromecast on the same network, purely as a source:
 
-1. **Discover** — mDNS/DNS-SD browse of `_googlecast._tcp.local`, parse TXT
+1. **Discover** — mDNS/DNS-SD browse of `_googlecast._tcp.local` (query
+   re-sent at 0/1/2 s inside a 5 s window, first match exits early), parse TXT
    records (friendly name, UUID, model, running app).
 2. **Connect** — TCP port 8009, Cast V2 framing (big-endian 4-byte length +
    protobuf `CastMessage`), TLS on modern firmware, plaintext on legacy.

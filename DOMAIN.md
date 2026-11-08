@@ -251,6 +251,11 @@ With `--device NAME`:
      literal `NAME`, i.e. `*NAME*` as a glob — again first arrival wins.
   3. If still none, fall back to the **first discovered device** (when at
      least one device exists).
+- The browse query is re-sent at 1s intervals up to three sends (≈0s, 1s,
+  2s) inside the same 5s window (§Retry Landscape row 1). Responses from
+  every attempt merge into one list by service-instance name, so a retry
+  never duplicates a device, and arrival order (hence the first-device
+  target) is unchanged.
 - If no device was discovered at all, the program reports an error
   (EXIT 1) after the window.
 
@@ -262,7 +267,7 @@ main
   → init_signal_handling  // sigprocmask + signalfd (SIGINT, SIGTERM, SIGCHLD)
   → resolve_buffer_policy // from --cache/--cache-to-fs; file stat when applicable
   → open_source           // fopen? no — open(2); fork+exec for --command
-  → discover              // mDNS browse window, collect devices (⟳ within window)
+  → discover              // mDNS browse: query at 0/1/2s, 5s window, first match exits
   → pick device           // §Device selection (--device filter, else first)
   → resolve_host          // mDNS target → ip
   → connect_transport     // TCP:8009, TLS or plaintext detection (§Transport)
@@ -882,7 +887,7 @@ in production code; raw `open`/`read`/`write` plus our buffer only).
 
 | # | Operation | Max trials | Interval | Backoff | Notes |
 |---|---|---|---|---|---|
-| 1 | mDNS discovery window | continuous receive, window 5s | — | — | No retry of the window itself; the socket listens until a device is found or the window lapses. Re-run only if the control-socket reconnect needs re-resolution. |
+| 1 | mDNS discovery window | 3 browse sends at 0s, 1s, 2s; continuous receive, window 5s | 1s | fixed | The PTR browse query is re-sent while unmatched and the window allows; the first matching response ends discovery immediately. A re-send does not restart the window: the 5s deadline is absolute, and there is no retry of the window itself. Re-run only if the control-socket reconnect needs re-resolution. |
 | 2 | TCP connect to device | 3 | 1s, 2s | exponential | On failure try the next discovered device; if exhausted → error. |
 | 3 | Device host (re)resolution | 3 | 1s | fixed | mDNS resolution of the target (`_googlecast._tcp.local` A/AAAA lookup for reconnects). |
 | 4 | Control handshake / GET_STATUS | 3 | 1s, 2s | exponential | Timeout per attempt 10s (`TIMEOUT_TIME` analog). Fail → error. |

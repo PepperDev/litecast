@@ -16,5 +16,11 @@ jobs:
       image: alpine
     steps:
       - name: Build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          wget -qO- "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/raw/$GITHUB_SHA/.github/scripts/build" | sh -es
+          wget -qO /tmp/build \
+            --header="Authorization: Bearer $GITHUB_TOKEN" \
+            --header="Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/contents/.github/scripts/build?ref=$GITHUB_SHA"
+          sh -e /tmp/build

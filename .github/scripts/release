@@ -18,7 +18,8 @@ for tc in \
   aarch64-linux-musl-cross
 do
   echo "Downloading $tc from $BASE..."
-  wget -qO- "$BASE/$tc.tgz" | tar -xzf- -C /opt/musl
+  wget -qO "/tmp/$tc.tgz" "$BASE/$tc.tgz"
+  tar -xzf "/tmp/$tc.tgz" -C /opt/musl
 done
 chmod -R a+rX /opt/musl
 
@@ -34,7 +35,8 @@ RPMDB=/tmp/rpmdb
 rpm --initdb --dbpath "$RPMDB"
 echo "=== Checkout ==="
 git init -q
-git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+git remote add origin \
+  "${GITHUB_SERVER_URL%%://*}://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#*://}/${GITHUB_REPOSITORY}.git"
 git fetch --tags -q --depth=1 origin "${GITHUB_REF}"
 git checkout -qf "${GITHUB_SHA}"
 

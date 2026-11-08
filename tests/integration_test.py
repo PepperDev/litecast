@@ -7,7 +7,7 @@ host:
   * a UDP responder answers the mDNS browse for `_googlecast._tcp.local`,
     advertising a device at 127.0.0.1:8009;
   * a TCP listener on 127.0.0.1:8009 speaks the minimal Cast V2 control plane
-    (CONNECT / GET_STATUS -> RECEIVER_STATUS -> LOAD);
+    (CONNECT / GET_STATUS+LAUNCH -> RECEIVER_STATUS -> LOAD);
   * on LOAD the fake device issues an HTTP GET to litecast's `contentId` and
     pulls the whole body.
 
@@ -250,6 +250,7 @@ def main():
         # --- start the real binary ---
         env = dict(os.environ)
         env["LITECAST_MDNS_MS"] = "4000"
+        env["LITECAST_TP"] = "plain"    # the fake device speaks legacy plaintext
         proc = subprocess.Popen(
             [binary, src.name],
             env=env,
@@ -257,8 +258,10 @@ def main():
             stderr=subprocess.PIPE,
         )
 
-        # --- answer the mDNS browse query ---
+        # --- answer the mDNS browse query; drop the first one to exercise
+        # the 1s re-send (the retry must recover the device) ---
         answer = build_mdns_response()
+        queries = 0
         answered = False
         while not answered:
             try:
@@ -267,6 +270,9 @@ def main():
                 break
             # A browse query carries QDCOUNT>=1; answer only the service browse.
             if len(data) >= 12 and struct.unpack(">H", data[4:6])[0] >= 1:
+                queries += 1
+                if queries < 2:
+                    continue
                 mdns.sendto(answer, peer)   # unicast reply (RFC 6762)
                 answered = True
         if not answered:
@@ -295,7 +301,7 @@ def main():
                 if ns == NS_CONN and got == "CONNECT":
                     sent_connect = True
                     # source_id is the protobuf field 2, not a JSON key.
-                elif ns == NS_RX and got == "GET_STATUS":
+                elif ns == NS_RX and got in ("GET_STATUS", "LAUNCH"):
                     # Reply back to litecast's source id; requestId echoes.
                     sock.sendall(proto_frame("receiver-0", src_id, NS_RX,
                                              '{"type":"RECEIVER_STATUS","sessionId":"session-42",'
@@ -303,13 +309,18 @@ def main():
                 elif ns == NS_MEDIA and got == "LOAD":
                     sent_load = True
                     sid = obj["sessionId"]
-                    cid = obj["contentId"]
+                    cid = obj["media"]["contentId"]
                     if sid != "session-42":
                         die("LOAD carried wrong sessionId: %s" % sid)
                     # Reply LOADED, then pull the stream the way a receiver would.
                     sock.sendall(proto_frame("receiver-0", src_id, NS_MEDIA,
                                              '{"type":"LOADED","sessionId":"%s"}' % sid))
                     http_pull(cid, source_bytes)
+                    # Natural play-to-end: the receiver reports the session
+                    # finished so litecast drains to EOF and exits 0.
+                    sock.sendall(proto_frame("receiver-0", src_id, NS_MEDIA,
+                                             '{"type":"MEDIA_STATUS","status":[{"playerState":"IDLE",'
+                                             '"idleReason":"FINISHED"}]}'))
                     done = True
                 elif ns == "urn:x-cast:com.google.cast.tp.heartbeat" and got == "PING":
                     sock.sendall(proto_frame("receiver-0", src_id,

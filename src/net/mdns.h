@@ -10,6 +10,10 @@
 #define MDNS_MAX_DEVICES 16
 #define MDNS_PKT_CAP 4096
 #define MDNS_WINDOW_MS 5000
+/* Re-send the browse query at 1s intervals, up to three sends total, so one
+ * dropped query or multicast response does not lose the whole window. */
+#define MDNS_RESEND_MS 1000
+#define MDNS_SEND_MAX 3
 
 #define MDNS_NAME_CAP 128
 
@@ -60,10 +64,12 @@ int mdns_first(const struct mdns_device *devices, int n, const char *pattern);
  * fallback, then first discovered; -1 when none. Pure. */
 int mdns_select(const struct mdns_device *devices, int n, const char *pattern);
 
-/* Full discovery window: open, browse, poll up to MDNS_WINDOW_MS, returning
- * as soon as a device matches (glob / first). On timeout applies the
- * substring then first fallback. Returns the selected index or -1.
- * mdns_discover_ms lets the caller choose the window (tests use a short one). */
+/* Full discovery window: open, browse, re-browse at MDNS_RESEND_MS while
+ * unmatched (at most MDNS_SEND_MAX sends), and poll up to the absolute
+ * MDNS_WINDOW_MS deadline, returning as soon as a device matches (glob /
+ * first). On timeout applies the substring then first fallback. Returns the
+ * selected index or -1. mdns_discover_ms lets the caller choose the window
+ * (tests use a short one); a window too short for a re-send sends once. */
 int mdns_discover(const char *local_addr, const char *pattern, struct mdns_device *devices, int maxdev);
 int mdns_discover_ms(const char *local_addr, const char *pattern, struct mdns_device *devices, int maxdev, int mswin);
 
