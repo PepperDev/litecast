@@ -84,12 +84,14 @@ resource**: it attaches at retained byte 0 (the drained device re-inits its
     end already produced) keeps the retained/behind/spawn ladder — else attach
     to a window that retains
     it, wait for the nearest producer behind it, or spawn a fresh producer;
-    an **open-ended** `Range` on an unknown-total stream is closed by the server
-    at the frontier — end = `received` when the start is already produced, end
+    an **open-ended mid-stream** `Range` (`N>0`) on an unknown-total stream is
+    closed by the server at the frontier — end = `received` when the start is already produced, end
     = `N+1` (one byte, head stowed until it exists) when a running producer has
     not reached `N` — answered `206` + `Content-Range: bytes N-E/*` +
     `Content-Length`, RFC 9110 §14.4, and served in place so the device resumes
-    mid-stream where it stopped instead of rewinding (trace.22); a cold start
+    mid-stream where it stopped instead of rewinding (trace.22); a `bytes=0-`
+    whole-resource pull stays **open** from byte 0 (a finite arbitrary end there
+    makes the DMR report FINISHED on a live source and restart); a cold start
     (nothing produced), a start below the retained prefix, and
     `--no-arbitrary-range` instead give `200` from **byte 0**; and the window
     advances at the slowest connected consumer's pace. A

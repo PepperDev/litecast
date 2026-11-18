@@ -489,6 +489,16 @@ static int t_spool(void)
   EXPECT(!bytes_in(resp, rl, "Content-Length:"));
   EXPECT(bytes_in(resp, rl, (const char *)DATA));
 
+  /* The device's first pull is `Range: bytes=0-`: a whole resource must stay
+   * open even when the producer is ahead. A finite arbitrary end here makes
+   * the DMR report FINISHED on a still-live source and restart the session. */
+  EXPECT(xact(&s, "GET /stream HTTP/1.1\r\nRange: bytes=0-\r\n\r\n", resp, sizeof resp, &rl) == 0);
+  EXPECT(bytes_in(resp, rl, "200 OK"));
+  EXPECT(bytes_in(resp, rl, "Connection: close"));
+  EXPECT(!bytes_in(resp, rl, "Content-Length:"));
+  EXPECT(!bytes_in(resp, rl, "Content-Range:"));
+  EXPECT(bytes_in(resp, rl, (const char *)DATA));
+
   /* A finished command with the head dropped: the spool serves ranges the
    * memory window already rewound past, caught up over the disk copy. */
   s.total = DLEN;

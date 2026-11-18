@@ -202,12 +202,12 @@ static int reroute_from_zero(struct http_srv *s, struct http_conn *c)
   return rv;
 }
 
-/* May the server close an open-ended `Range: bytes=N-` itself? A known total or
- * `--no-arbitrary-range` forbids it; a cold stream or a start already dropped
- * from the window is rule 0's whole-resource 200 instead. */
+/* A cold stream, a dropped start, and `N == 0` (the device's first whole-
+ * resource pull — a finite end there makes it FINISHED and restart) are rule 0. */
 static int pin_closable(const struct http_srv *s, const struct http_conn *c, unsigned long long recv)
 {
-  return s->arbitrary_end && c->end == HTTP_RANGE_OPEN && s->total == 0 && recv > 0 && c->start >= stream_avail(s, c);
+  return s->arbitrary_end && c->end == HTTP_RANGE_OPEN && s->total == 0 &&
+      recv > 0 && c->start != 0 && c->start >= stream_avail(s, c);
 }
 
 /* The device's own live resume (trace.22): the end is the live frontier, or

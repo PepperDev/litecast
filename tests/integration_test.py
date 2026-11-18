@@ -180,7 +180,8 @@ def http_pull(content_id, expected):
         path = "/" + path
     s = socket.create_connection((host, int(port)))
     s.settimeout(20)
-    req = ("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % (path, hostport)).encode()
+    req = ("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n"
+           "Range: bytes=0-\r\n\r\n" % (path, hostport)).encode()
     s.sendall(req)
     data = b""
     buf = bytearray()
@@ -205,6 +206,148 @@ def http_pull(content_id, expected):
     return data
 
 
+def run_case(binary, operands, source_bytes, label):
+    """Drive one fake-device session with the given litecast CLI operands."""
+    # --- fake device: mDNS responder + control-plane TCP listener ---
+    mdns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    mdns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        mdns.bind((MCAST_GROUP, MCAST_PORT))
+    except OSError as e:
+        print(HDR + " SKIP mDNS bind: %s (multicast unavailable?)" % e)
+        return 1
+    mdns.setsockopt(
+        socket.IPPROTO_IP,
+        socket.IP_ADD_MEMBERSHIP,
+        struct.pack("4s4s", socket.inet_aton(MCAST_GROUP), socket.inet_aton("0.0.0.0")),
+    )
+    mdns.settimeout(20)
+
+    ctrl = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ctrl.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        ctrl.bind(("127.0.0.1", CAST_PORT))
+    except OSError as e:
+        print(HDR + " SKIP port %d in use: %s" % (CAST_PORT, e))
+        mdns.close()
+        return 1
+    ctrl.listen(1)
+    ctrl.settimeout(30)
+
+    # --- start the real binary ---
+    env = dict(os.environ)
+    env["LITECAST_MDNS_MS"] = "4000"
+    env["LITECAST_TP"] = "plain"    # the fake device speaks legacy plaintext
+    proc = subprocess.Popen(
+        [binary] + operands,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    # --- answer the mDNS browse query; drop the first one to exercise
+    # the 1s re-send (the retry must recover the device) ---
+    answer = build_mdns_response()
+    queries = 0
+    answered = False
+    while not answered:
+        try:
+            data, peer = mdns.recvfrom(4096)
+        except socket.timeout:
+            break
+        # A browse query carries QDCOUNT>=1; answer only the service browse.
+        if len(data) >= 12 and struct.unpack(">H", data[4:6])[0] >= 1:
+            queries += 1
+            if queries < 2:
+                continue
+            mdns.sendto(answer, peer)   # unicast reply (RFC 6762)
+            answered = True
+    if not answered:
+        proc.kill()
+        mdns.close()
+        ctrl.close()
+        die("no mDNS browse query received from litecast")
+
+    # --- accept the control connection and drive the protocol ---
+    sock = None
+    try:
+        sock, _ = ctrl.accept()
+        sock.settimeout(20)
+
+        src_id = None           # litecast's per-session sender id
+        sent_connect = sent_load = False
+        load_count = stop_count = 0
+        done = False
+        while not done:
+            frame = recv_frame(sock)
+            if frame is None:
+                break
+            src_id, ns, payload = frame
+            obj = parse_json(payload)
+            got = obj.get("type", "")
+
+            if ns == NS_CONN and got == "CONNECT":
+                sent_connect = True
+                # source_id is the protobuf field 2, not a JSON key.
+            elif ns == NS_RX and got in ("GET_STATUS", "LAUNCH"):
+                # Reply back to litecast's source id; requestId echoes.
+                sock.sendall(proto_frame("receiver-0", src_id, NS_RX,
+                                         '{"type":"RECEIVER_STATUS","sessionId":"session-42",'
+                                         '"requestId":%d}' % obj["requestId"]))
+            elif ns == NS_MEDIA and got == "LOAD":
+                sent_load = True
+                load_count += 1
+                sid = obj["sessionId"]
+                cid = obj["media"]["contentId"]
+                if sid != "session-42":
+                    die("LOAD carried wrong sessionId: %s" % sid)
+                # Reply LOADED, then pull the stream the way a receiver would.
+                sock.sendall(proto_frame("receiver-0", src_id, NS_MEDIA,
+                                         '{"type":"LOADED","sessionId":"%s"}' % sid))
+                http_pull(cid, source_bytes)
+                # Natural play-to-end: the receiver reports the session
+                # finished so litecast drains to EOF and exits 0.
+                sock.sendall(proto_frame("receiver-0", src_id, NS_MEDIA,
+                                         '{"type":"MEDIA_STATUS","status":[{"playerState":"IDLE",'
+                                         '"idleReason":"FINISHED"}]}'))
+                done = True
+            elif ns == NS_RX and got == "STOP":
+                stop_count += 1
+            elif ns == "urn:x-cast:com.google.cast.tp.heartbeat" and got == "PING":
+                sock.sendall(proto_frame("receiver-0", src_id,
+                                         "urn:x-cast:com.google.cast.tp.heartbeat",
+                                         '{"type":"PONG"}'))
+        if not sent_connect or not sent_load:
+            pass                # reported below after the child is reaped
+    finally:
+        if sock is not None:
+            sock.close()
+        ctrl.close()
+        mdns.close()
+        # The binary should exit 0 on its own once the pull is fully
+        # drained (natural end). Give it a short grace, then kill so a
+        # hanging child cannot leak.
+        try:
+            rc = proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+            rc = proc.returncode
+        if rc != 0:
+            die("binary exited %d (expected natural 0)" % rc)
+
+    if not sent_connect:
+        die("device never saw the CONNECT frame")
+    if not sent_load:
+        die("device never saw the LOAD frame")
+    if load_count != 1 or stop_count:
+        die("%s: expected one LOAD and no restart, got %d LOAD / %d STOP"
+            % (label, load_count, stop_count))
+    print(HDR + " OK %s: handshake, one LOAD, and %d-byte stream pull"
+          % (label, len(source_bytes)))
+    return 0
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
         print("usage: python3 tests/integration_test.py")
@@ -214,144 +357,29 @@ def main():
     if not os.path.exists(binary):
         die("binary %s missing -- run 'make all' first" % binary)
 
-    # Source file with a distinctive payload.
-    src = tempfile.NamedTemporaryFile(mode="wb", suffix=".mp4", delete=False)
     source_bytes = b"hello-integration-stream-0123456789-\xff\x00\x7f" * 64
+    src = tempfile.NamedTemporaryFile(mode="wb", suffix=".mp4", delete=False)
     src.write(source_bytes)
     src.close()
-
+    slow = None
     try:
-        # --- fake device: mDNS responder + control-plane TCP listener ---
-        mdns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        mdns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            mdns.bind((MCAST_GROUP, MCAST_PORT))
-        except OSError as e:
-            print(HDR + " SKIP mDNS bind: %s (multicast unavailable?)" % e)
+        if run_case(binary, [src.name], source_bytes, "file mode") != 0:
             return 1
-        mdns.setsockopt(
-            socket.IPPROTO_IP,
-            socket.IP_ADD_MEMBERSHIP,
-            struct.pack("4s4s", socket.inet_aton(MCAST_GROUP), socket.inet_aton("0.0.0.0")),
-        )
-        mdns.settimeout(20)
-
-        ctrl = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        ctrl.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            ctrl.bind(("127.0.0.1", CAST_PORT))
-        except OSError as e:
-            print(HDR + " SKIP port %d in use: %s" % (CAST_PORT, e))
-            mdns.close()
+        # Spooled command still producing at the DMR's first `Range: bytes=0-`
+        # pull: the whole resource must stay open, not close at the frontier.
+        slow = src.name + ".sh"
+        with open(slow, "w") as f:
+            f.write("#!/bin/sh\ndd if=%s bs=64 count=8 status=none\n"
+                    "sleep 5\ndd if=%s bs=64 skip=8 status=none\n"
+                    % (src.name, src.name))
+        os.chmod(slow, 0o755)
+        if run_case(binary, ["-s", "-c", "--", slow], source_bytes, "command+spool") != 0:
             return 1
-        ctrl.listen(1)
-        ctrl.settimeout(30)
-
-        # --- start the real binary ---
-        env = dict(os.environ)
-        env["LITECAST_MDNS_MS"] = "4000"
-        env["LITECAST_TP"] = "plain"    # the fake device speaks legacy plaintext
-        proc = subprocess.Popen(
-            [binary, src.name],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        # --- answer the mDNS browse query; drop the first one to exercise
-        # the 1s re-send (the retry must recover the device) ---
-        answer = build_mdns_response()
-        queries = 0
-        answered = False
-        while not answered:
-            try:
-                data, peer = mdns.recvfrom(4096)
-            except socket.timeout:
-                break
-            # A browse query carries QDCOUNT>=1; answer only the service browse.
-            if len(data) >= 12 and struct.unpack(">H", data[4:6])[0] >= 1:
-                queries += 1
-                if queries < 2:
-                    continue
-                mdns.sendto(answer, peer)   # unicast reply (RFC 6762)
-                answered = True
-        if not answered:
-            proc.kill()
-            mdns.close()
-            ctrl.close()
-            die("no mDNS browse query received from litecast")
-
-        # --- accept the control connection and drive the protocol ---
-        sock = None
-        try:
-            sock, _ = ctrl.accept()
-            sock.settimeout(20)
-
-            src_id = None           # litecast's per-session sender id
-            sent_connect = sent_load = False
-            done = False
-            while not done:
-                frame = recv_frame(sock)
-                if frame is None:
-                    break
-                src_id, ns, payload = frame
-                obj = parse_json(payload)
-                got = obj.get("type", "")
-
-                if ns == NS_CONN and got == "CONNECT":
-                    sent_connect = True
-                    # source_id is the protobuf field 2, not a JSON key.
-                elif ns == NS_RX and got in ("GET_STATUS", "LAUNCH"):
-                    # Reply back to litecast's source id; requestId echoes.
-                    sock.sendall(proto_frame("receiver-0", src_id, NS_RX,
-                                             '{"type":"RECEIVER_STATUS","sessionId":"session-42",'
-                                             '"requestId":%d}' % obj["requestId"]))
-                elif ns == NS_MEDIA and got == "LOAD":
-                    sent_load = True
-                    sid = obj["sessionId"]
-                    cid = obj["media"]["contentId"]
-                    if sid != "session-42":
-                        die("LOAD carried wrong sessionId: %s" % sid)
-                    # Reply LOADED, then pull the stream the way a receiver would.
-                    sock.sendall(proto_frame("receiver-0", src_id, NS_MEDIA,
-                                             '{"type":"LOADED","sessionId":"%s"}' % sid))
-                    http_pull(cid, source_bytes)
-                    # Natural play-to-end: the receiver reports the session
-                    # finished so litecast drains to EOF and exits 0.
-                    sock.sendall(proto_frame("receiver-0", src_id, NS_MEDIA,
-                                             '{"type":"MEDIA_STATUS","status":[{"playerState":"IDLE",'
-                                             '"idleReason":"FINISHED"}]}'))
-                    done = True
-                elif ns == "urn:x-cast:com.google.cast.tp.heartbeat" and got == "PING":
-                    sock.sendall(proto_frame("receiver-0", src_id,
-                                             "urn:x-cast:com.google.cast.tp.heartbeat",
-                                             '{"type":"PONG"}'))
-            if not sent_connect or not sent_load:
-                pass                # reported below after the child is reaped
-        finally:
-            if sock is not None:
-                sock.close()
-            ctrl.close()
-            mdns.close()
-            # The binary should exit 0 on its own once the pull is fully
-            # drained (natural end). Give it a short grace, then kill so a
-            # hanging child cannot leak.
-            try:
-                rc = proc.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
-                rc = proc.returncode
-            if rc != 0:
-                die("binary exited %d (expected natural 0)" % rc)
-
-        if not sent_connect:
-            die("device never saw the CONNECT frame")
-        if not sent_load:
-            die("device never saw the LOAD frame")
-        print(HDR + " OK mDNS discovered device, handshake, LOAD, and %d-byte stream pull" % len(source_bytes))
     finally:
         os.unlink(src.name)
+        if slow is not None:
+            os.unlink(slow)
+    return 0
 
 
 if __name__ == "__main__":
